@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import re
 
 from urllib.parse import urlparse, unquote
+from datetime import datetime, timezone
 
 app = Flask(__name__)
 
@@ -989,7 +990,266 @@ def sanitize_output():
     })
 
 
+# ============================================================
+# Q5 - OSINT Corroboration Engine
+# ============================================================
 
+VALID_SOURCE_TYPES = {
+    "dns",
+    "ct_log",
+    "registry",
+    "archive",
+    "scan"
+}
+
+
+def parse_timestamp(value):
+    """
+    Parse an ISO-8601 timestamp deterministically.
+    Returns a timezone-aware datetime or None.
+    """
+    if not isinstance(value, str):
+        return None
+
+    try:
+        # Handle trailing Z
+        normalized = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+
+        # Make naive timestamps UTC if encountered
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        return dt.astimezone(timezone.utc)
+
+    except (ValueError, TypeError):
+        return None
+
+
+def valid_osint_source(source):
+    """
+    A valid source must have:
+      id, origin, value, observedAt -> strings
+      type -> one of the allowed types
+    """
+
+    if not isinstance(source, dict):
+        return False
+
+    if not isinstance(source.get("id"), str):
+        return False
+
+    if not isinstance(source.get("origin"), str):
+        return False
+
+    if not isinstance(source.get("value"), str):
+        return False
+
+    if not isinstance(source.get("observedAt"), str):
+        return False
+
+    if source.get("type") not in VALID_SOURCE_TYPES:
+        return False
+
+    return True
+
+
+@app.route("/corroborate", methods=["POST"])
+def corroborate():
+
+    data = request.get_json(silent=True)
+
+    # --------------------------------------------------------
+    # 1. INVALID INPUT
+    # --------------------------------------------------------
+
+    if not isinstance(data, dict):
+        return jsonify({
+            "verdict": "invalid",
+            "confidence": "low",
+            "corroboratingSources": []
+        })
+
+    claim = data.get("claim")
+
+    if not isinstance(claim, dict):
+        return jsonify({
+            "verdict": "invalid",
+            "confidence": "low",
+            "corroboratingSources": []
+        })
+
+    if not isinstance(claim.get("value"), str):
+        return jsonify({
+            "verdict": "invalid",
+            "confidence": "low",
+            "corroboratingSources": []
+        })
+
+    as_of = parse_timestamp(data.get("asOf"))
+
+    if as_of is None:
+        return jsonify({
+            "verdict": "invalid",
+            "confidence": "low",
+            "corroboratingSources": []
+        })
+
+    staleness_days = data.get("stalenessDays")
+
+    # bool is technically an int in Python, but must not
+    # be accepted as a number here.
+    if (
+        isinstance(staleness_days, bool)
+        or not isinstance(staleness_days, (int, float))
+    ):
+        return jsonify({
+            "verdict": "invalid",
+            "confidence": "low",
+            "corroboratingSources": []
+        })
+
+    sources = data.get("sources")
+
+    if not isinstance(sources, list):
+        return jsonify({
+            "verdict": "invalid",
+            "confidence": "low",
+            "corroboratingSources": []
+        })
+
+    claim_value = claim["value"]
+
+    # --------------------------------------------------------
+    # Keep only valid sources
+    # --------------------------------------------------------
+
+    valid_sources = []
+
+    for source in sources:
+
+        if not valid_osint_source(source):
+            continue
+
+        observed_at = parse_timestamp(source["observedAt"])
+
+        # A source whose timestamp cannot be parsed cannot
+        # participate in the freshness calculation.
+        if observed_at is None:
+            continue
+
+        valid_sources.append({
+            "id": source["id"],
+            "type": source["type"],
+            "origin": source["origin"],
+            "value": source["value"],
+            "observedAt": observed_at,
+            "authoritative": source.get("authoritative") is True
+        })
+
+    # --------------------------------------------------------
+    # Determine freshness
+    # --------------------------------------------------------
+
+    max_age_seconds = staleness_days * 24 * 60 * 60
+
+    fresh_sources = []
+
+    for source in valid_sources:
+
+        age_seconds = (
+            as_of - source["observedAt"]
+        ).total_seconds()
+
+        # Fresh means:
+        # asOf - observedAt <= stalenessDays
+        if age_seconds <= max_age_seconds:
+            fresh_sources.append(source)
+
+    # --------------------------------------------------------
+    # 2. AUTHORITATIVE CONTRADICTION
+    # --------------------------------------------------------
+
+    contradicting = [
+        source
+        for source in fresh_sources
+        if (
+            source["authoritative"]
+            and source["value"] != claim_value
+        )
+    ]
+
+    if contradicting:
+
+        ids = sorted(
+            source["id"]
+            for source in contradicting
+        )
+
+        return jsonify({
+            "verdict": "contradicted",
+            "confidence": "low",
+            "corroboratingSources": ids
+        })
+
+    # --------------------------------------------------------
+    # 3. SUPPORT
+    # --------------------------------------------------------
+
+    matching_sources = [
+        source
+        for source in fresh_sources
+        if source["value"] == claim_value
+    ]
+
+    # Reduce to one representative per origin.
+    # Representative = lexicographically smallest ID.
+    representatives = {}
+
+    for source in matching_sources:
+
+        origin = source["origin"]
+
+        if origin not in representatives:
+            representatives[origin] = source
+
+        elif source["id"] < representatives[origin]["id"]:
+            representatives[origin] = source
+
+    reps = list(representatives.values())
+
+    if len(reps) >= 2:
+
+        representative_ids = sorted(
+            source["id"]
+            for source in reps
+        )
+
+        distinct_types = {
+            source["type"]
+            for source in reps
+        }
+
+        if len(distinct_types) >= 2:
+            confidence = "high"
+        else:
+            confidence = "medium"
+
+        return jsonify({
+            "verdict": "supported",
+            "confidence": confidence,
+            "corroboratingSources": representative_ids
+        })
+
+    # --------------------------------------------------------
+    # 4. UNVERIFIED
+    # --------------------------------------------------------
+
+    return jsonify({
+        "verdict": "unverified",
+        "confidence": "low",
+        "corroboratingSources": []
+    })
 
 
 
