@@ -1,0 +1,94 @@
+name: TDS GA7 Release Gate
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  release-gate-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: TDS identity: 23f3000872@ds.study.iitm.ac.in
+        run: echo "TDS identity: 23f3000872@ds.study.iitm.ac.in"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start release gate
+        run: |
+          python app.py > server.log 2>&1 &
+          sleep 3
+
+      - name: Test release gate
+        run: |
+          python - <<'PY'
+          import json
+          import urllib.request
+
+          payload = {
+              "target": "production",
+              "event": "push",
+              "ref": "refs/heads/main",
+              "workflow": {
+                  "trigger": "push",
+                  "permissions": {
+                      "contents": "read",
+                      "packages": "write",
+                      "id-token": "none"
+                  },
+                  "testsPassed": True,
+                  "matrixComplete": True,
+                  "failFast": False,
+                  "actions": [
+                      {
+                          "owner": "actions",
+                          "name": "checkout",
+                          "ref": "v4"
+                      },
+                      {
+                          "owner": "docker",
+                          "name": "build-push-action",
+                          "ref": "0123456789abcdef0123456789abcdef01234567"
+                      }
+                  ],
+                  "environmentApproval": True
+              },
+              "image": {
+                  "multiStage": True,
+                  "runsAsRoot": False,
+                  "secretMode": "none",
+                  "criticalVulnerabilities": 0,
+                  "digestPinned": True
+              }
+          }
+
+          req = urllib.request.Request(
+              "http://127.0.0.1:8000/release-gate",
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST"
+          )
+
+          with urllib.request.urlopen(req) as response:
+              result = json.load(response)
+
+          print(result)
+
+          assert result == {
+              "decision": "promote",
+              "violations": []
+          }
+          PY
