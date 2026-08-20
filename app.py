@@ -377,5 +377,285 @@ def action_firewall():
             "reason": "ALLOW"
         })
 
+
+
+# ============================================================
+# Q3 - Terraform Plan Policy Gate
+# ============================================================
+
+PROD_WORKSPACE = "prod-4qr8sw"
+
+REQUIRED_LABELS = {
+    "owner": "student-gy85i",
+    "environment": "production",
+    "cost_center": "cc-t9vg"
+}
+
+ALLOWED_BACKENDS = {
+    "gcs",
+    "s3",
+    "azurerm",
+    "remote"
+}
+
+STATEFUL_DELETE_TYPES = {
+    "storage_bucket",
+    "sql_database",
+    "persistent_disk"
+}
+
+
+@app.route("/terraform/plan", methods=["POST"])
+def terraform_plan():
+    data = request.get_json(silent=True)
+
+    # --------------------------------------------------------
+    # 1. REQUEST / NESTED OBJECT TYPES
+    # --------------------------------------------------------
+    if not isinstance(data, dict):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    required_top = {
+        "environment",
+        "state",
+        "providerVersion",
+        "destroyApproved",
+        "resource"
+    }
+
+    if not required_top.issubset(data.keys()):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if not isinstance(data["environment"], str):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if not isinstance(data["providerVersion"], str):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if not isinstance(data["destroyApproved"], bool):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    # State must be an object
+    state = data["state"]
+
+    if not isinstance(state, dict):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if "backend" not in state or "locked" not in state:
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if not isinstance(state["backend"], str):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if not isinstance(state["locked"], bool):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    # Resource must be an object
+    resource = data["resource"]
+
+    if not isinstance(resource, dict):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    required_resource = {
+        "address",
+        "type",
+        "action",
+        "labels",
+        "secret",
+        "forceDestroy"
+    }
+
+    if not required_resource.issubset(resource.keys()):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if not isinstance(resource["address"], str):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if not isinstance(resource["type"], str):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if resource["action"] not in {"create", "update", "delete"}:
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if not isinstance(resource["labels"], dict):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    # Every label value should be a string
+    for key, value in resource["labels"].items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            return jsonify({
+                "decision": "reject",
+                "reason": "INVALID_PLAN"
+            })
+
+    # secret may be null or string
+    if resource["secret"] is not None and not isinstance(
+        resource["secret"], str
+    ):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if not isinstance(resource["forceDestroy"], bool):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    # --------------------------------------------------------
+    # 2. ENVIRONMENT
+    # --------------------------------------------------------
+    if data["environment"] != PROD_WORKSPACE:
+        return jsonify({
+            "decision": "reject",
+            "reason": "ENVIRONMENT_MISMATCH"
+        })
+
+    # --------------------------------------------------------
+    # 3. REMOTE STATE
+    # --------------------------------------------------------
+    if state["backend"] not in ALLOWED_BACKENDS:
+        return jsonify({
+            "decision": "reject",
+            "reason": "STATE_UNSAFE"
+        })
+
+    if state["locked"] is not True:
+        return jsonify({
+            "decision": "reject",
+            "reason": "STATE_UNSAFE"
+        })
+
+    # --------------------------------------------------------
+    # 4. PROVIDER VERSION
+    # --------------------------------------------------------
+    provider = data["providerVersion"]
+
+    if provider not in {
+        "6.2.1",
+        "= 6.2.1",
+        "~> 6.0"
+    }:
+        return jsonify({
+            "decision": "reject",
+            "reason": "UNPINNED_PROVIDER"
+        })
+
+    # --------------------------------------------------------
+    # 5. REQUIRED LABELS
+    # --------------------------------------------------------
+    labels = resource["labels"]
+
+    for key, expected_value in REQUIRED_LABELS.items():
+        if labels.get(key) != expected_value:
+            return jsonify({
+                "decision": "reject",
+                "reason": "MISSING_LABELS"
+            })
+
+    # --------------------------------------------------------
+    # 6. SECRET
+    # --------------------------------------------------------
+    secret = resource["secret"]
+
+    if secret is not None:
+        if not isinstance(secret, str):
+            return jsonify({
+                "decision": "reject",
+                "reason": "PLAINTEXT_SECRET"
+            })
+
+        if not secret.startswith("secret://"):
+            return jsonify({
+                "decision": "reject",
+                "reason": "PLAINTEXT_SECRET"
+            })
+
+        # Must have something after secret://
+        if len(secret) <= len("secret://"):
+            return jsonify({
+                "decision": "reject",
+                "reason": "PLAINTEXT_SECRET"
+            })
+
+    # --------------------------------------------------------
+    # 7. STATEFUL DELETE APPROVAL
+    # --------------------------------------------------------
+    if (
+        resource["action"] == "delete"
+        and resource["type"] in STATEFUL_DELETE_TYPES
+    ):
+        if data["destroyApproved"] is not True:
+            return jsonify({
+                "decision": "reject",
+                "reason": "DELETE_NOT_APPROVED"
+            })
+
+    # --------------------------------------------------------
+    # 8. FORCE DESTROY
+    # --------------------------------------------------------
+    if (
+        resource["type"] == "storage_bucket"
+        and resource["forceDestroy"] is True
+    ):
+        return jsonify({
+            "decision": "reject",
+            "reason": "FORCE_DESTROY"
+        })
+
+    # --------------------------------------------------------
+    # EVERYTHING PASSED
+    # --------------------------------------------------------
+    return jsonify({
+        "decision": "approve",
+        "reason": "APPROVE"
+    })
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
