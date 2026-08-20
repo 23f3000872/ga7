@@ -1,6 +1,8 @@
 from flask import Flask, request, jsonify
 import re
 
+from urllib.parse import urlparse, unquote
+
 app = Flask(__name__)
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
@@ -656,6 +658,340 @@ def terraform_plan():
         "decision": "approve",
         "reason": "APPROVE"
     })
+
+
+
+
+# ============================================================
+# Q4 - LLM Output Handling Gate
+# ============================================================
+
+ALLOWED_EXTERNAL_HOSTS = {
+    "cdn-26kxsip.example",
+    "app-p4mj99r.example"
+}
+
+VALID_CHANNELS = {
+    "html",
+    "markdown",
+    "url",
+    "sql",
+    "shell"
+}
+
+
+def decode_once(value):
+    """
+    Decode exactly once in this order:
+    1. percent escapes
+    2. specified HTML entities
+    3. \\uXXXX escapes
+    """
+
+    # 1. Percent escapes
+    decoded = unquote(value)
+
+    # 2. HTML entities requested by the question
+    entity_map = {
+        "&lt;": "<",
+        "&gt;": ">",
+        "&quot;": '"',
+        "&apos;": "'",
+        "&amp;": "&"
+    }
+
+    # Named entities
+    for entity, replacement in entity_map.items():
+        decoded = decoded.replace(entity, replacement)
+
+    # Numeric HTML entities: &#NN; and &#xNN;
+    def decode_numeric_entity(match):
+        token = match.group(1)
+
+        try:
+            if token.lower().startswith("x"):
+                return chr(int(token[1:], 16))
+            return chr(int(token, 10))
+        except (ValueError, OverflowError):
+            return match.group(0)
+
+    decoded = re.sub(
+        r"&#([0-9]+|x[0-9a-fA-F]+);",
+        decode_numeric_entity,
+        decoded,
+        flags=re.IGNORECASE
+    )
+
+    # 3. \uXXXX escapes
+    def decode_unicode_escape(match):
+        try:
+            return chr(int(match.group(1), 16))
+        except ValueError:
+            return match.group(0)
+
+    decoded = re.sub(
+        r"\\u([0-9a-fA-F]{4})",
+        decode_unicode_escape,
+        decoded
+    )
+
+    return decoded
+
+
+def extract_urls(text, channel):
+    """
+    Extract URLs according to the channel-specific rules.
+    Returns a list of URL strings.
+    """
+
+    if channel == "html":
+        # Only quoted src= and href= attributes
+        pattern = (
+            r"""(?:src|href)\s*=\s*["']([^"']+)["']"""
+        )
+        return re.findall(pattern, text, re.IGNORECASE)
+
+    if channel == "markdown":
+        # URL/target inside ](...)
+        pattern = r"""\]\(\s*(?:<([^>]+)>|([^)]+))\)"""
+        matches = re.findall(pattern, text)
+        return [a if a else b for a, b in matches]
+
+    if channel == "url":
+        return [text.strip()]
+
+    return []
+
+
+def has_dangerous_scheme(text, channel):
+    """
+    Detect javascript:, data:, vbscript:
+    and extracted URL schemes other than http/https.
+    """
+
+    # Explicit dangerous schemes anywhere in text.
+    if re.search(
+        r"(?:javascript|data|vbscript)\s*:",
+        text,
+        re.IGNORECASE
+    ):
+        return True
+
+    # Check extracted URLs.
+    urls = extract_urls(text, channel)
+
+    for value in urls:
+        candidate = value.strip()
+
+        # Protocol-relative URL is treated as https.
+        if candidate.startswith("//"):
+            continue
+
+        parsed = urlparse(candidate)
+
+        # If it has a scheme, only http/https are allowed.
+        if parsed.scheme:
+            if parsed.scheme.lower() not in {"http", "https"}:
+                return True
+
+    return False
+
+
+def has_external_exfil(text, channel):
+    """
+    Absolute URLs must have an exact allowed hostname.
+    """
+
+    urls = extract_urls(text, channel)
+
+    for value in urls:
+        candidate = value.strip()
+
+        # Protocol-relative references count as absolute
+        # and are resolved as https.
+        if candidate.startswith("//"):
+            parsed = urlparse("https:" + candidate)
+            hostname = parsed.hostname
+
+            if hostname not in ALLOWED_EXTERNAL_HOSTS:
+                return True
+
+            continue
+
+        parsed = urlparse(candidate)
+
+        # Only absolute URLs are subject to external host checking.
+        if parsed.scheme and parsed.netloc:
+            hostname = parsed.hostname
+
+            if hostname not in ALLOWED_EXTERNAL_HOSTS:
+                return True
+
+    return False
+
+
+def channel_violation(text, channel):
+    """
+    Apply channel-specific rules in the exact required order.
+    Returns None if safe.
+    """
+
+    if channel == "html":
+
+        # 1. SCRIPT_TAG
+        if re.search(
+            r"<\s*(?:script|iframe|object|embed)\b",
+            text,
+            re.IGNORECASE
+        ):
+            return "SCRIPT_TAG"
+
+        # 2. EVENT_HANDLER
+        if re.search(
+            r"\bon[a-zA-Z]+\s*=",
+            text,
+            re.IGNORECASE
+        ):
+            return "EVENT_HANDLER"
+
+        # 3. DANGEROUS_SCHEME
+        if has_dangerous_scheme(text, channel):
+            return "DANGEROUS_SCHEME"
+
+        # 4. EXTERNAL_EXFIL
+        if has_external_exfil(text, channel):
+            return "EXTERNAL_EXFIL"
+
+        return None
+
+    if channel == "markdown":
+
+        # 1. DANGEROUS_SCHEME
+        if has_dangerous_scheme(text, channel):
+            return "DANGEROUS_SCHEME"
+
+        # 2. EXTERNAL_EXFIL
+        if has_external_exfil(text, channel):
+            return "EXTERNAL_EXFIL"
+
+        return None
+
+    if channel == "url":
+
+        # 1. DANGEROUS_SCHEME
+        if has_dangerous_scheme(text, channel):
+            return "DANGEROUS_SCHEME"
+
+        # 2. EXTERNAL_EXFIL
+        if has_external_exfil(text, channel):
+            return "EXTERNAL_EXFIL"
+
+        return None
+
+    if channel == "sql":
+
+        if re.search(
+            r"""['";]|--|/\*|\bunion\b|\bor\s+1\s*=\s*1\b""",
+            text,
+            re.IGNORECASE
+        ):
+            return "SQL_METACHAR"
+
+        return None
+
+    if channel == "shell":
+
+        if (
+            re.search(r"[;&|`<>]", text)
+            or "$(" in text
+            or "${" in text
+        ):
+            return "SHELL_METACHAR"
+
+        return None
+
+    return None
+
+
+@app.route("/sanitize-output", methods=["POST"])
+def sanitize_output():
+
+    data = request.get_json(silent=True)
+
+    # --------------------------------------------------------
+    # 1. INVALID SCHEMA
+    # --------------------------------------------------------
+
+    if not isinstance(data, dict):
+        return jsonify({
+            "safe": False,
+            "reason": "INVALID_SCHEMA"
+        })
+
+    if data.get("channel") not in VALID_CHANNELS:
+        return jsonify({
+            "safe": False,
+            "reason": "INVALID_SCHEMA"
+        })
+
+    if not isinstance(data.get("output"), str):
+        return jsonify({
+            "safe": False,
+            "reason": "INVALID_SCHEMA"
+        })
+
+    output = data["output"]
+    channel = data["channel"]
+
+    if len(output) > 20000:
+        return jsonify({
+            "safe": False,
+            "reason": "INVALID_SCHEMA"
+        })
+
+    # --------------------------------------------------------
+    # 2. ENCODED PAYLOAD
+    # --------------------------------------------------------
+
+    decoded = decode_once(output)
+
+    if decoded != output:
+        decoded_violation = channel_violation(
+            decoded,
+            channel
+        )
+
+        if decoded_violation is not None:
+            return jsonify({
+                "safe": False,
+                "reason": "ENCODED_PAYLOAD"
+            })
+
+    # --------------------------------------------------------
+    # 3. ORIGINAL OUTPUT CHANNEL RULES
+    # --------------------------------------------------------
+
+    violation = channel_violation(output, channel)
+
+    if violation is not None:
+        return jsonify({
+            "safe": False,
+            "reason": violation
+        })
+
+    # --------------------------------------------------------
+    # SAFE
+    # --------------------------------------------------------
+
+    return jsonify({
+        "safe": True,
+        "reason": "SAFE"
+    })
+
+
+
+
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
