@@ -103,5 +103,279 @@ def release_gate():
     })
 
 
+
+
+
+ASSIGNED_TENANT = "tenant-74pxhxr"
+ALLOWED_EMAIL_DOMAIN = "notify-2vpfaru.example"
+
+
+def exact_keys(obj, required_keys):
+    return (
+        isinstance(obj, dict)
+        and set(obj.keys()) == set(required_keys)
+    )
+
+
+def valid_html(html):
+    if not isinstance(html, str):
+        return False
+
+    # Block <script> elements
+    if re.search(r"<\s*script\b", html, re.IGNORECASE):
+        return False
+
+    # Block <iframe> elements
+    if re.search(r"<\s*iframe\b", html, re.IGNORECASE):
+        return False
+
+    # Block inline event handlers such as onclick=, onload=, onerror=, etc.
+    if re.search(r"\bon[a-zA-Z]+\s*=", html, re.IGNORECASE):
+        return False
+
+    # Block javascript: URLs
+    if re.search(r"javascript\s*:", html, re.IGNORECASE):
+        return False
+
+    return True
+
+
+@app.route("/action-firewall", methods=["POST"])
+def action_firewall():
+    data = request.get_json(silent=True)
+
+    # --------------------------------------------------
+    # 1. TOP-LEVEL SCHEMA
+    # --------------------------------------------------
+    if not isinstance(data, dict):
+        return jsonify({
+            "decision": "block",
+            "reason": "INVALID_SCHEMA"
+        })
+
+    allowed_top_keys = {
+        "provenance",
+        "humanApproved",
+        "untrustedContent",
+        "action"
+    }
+
+    required_top_keys = {
+        "provenance",
+        "humanApproved",
+        "action"
+    }
+
+    if not required_top_keys.issubset(data.keys()):
+        return jsonify({
+            "decision": "block",
+            "reason": "INVALID_SCHEMA"
+        })
+
+    if not set(data.keys()).issubset(allowed_top_keys):
+        return jsonify({
+            "decision": "block",
+            "reason": "INVALID_SCHEMA"
+        })
+
+    if data.get("provenance") not in ("trusted", "untrusted"):
+        return jsonify({
+            "decision": "block",
+            "reason": "INVALID_SCHEMA"
+        })
+
+    if not isinstance(data.get("humanApproved"), bool):
+        return jsonify({
+            "decision": "block",
+            "reason": "INVALID_SCHEMA"
+        })
+
+    if "untrustedContent" in data and not isinstance(
+        data["untrustedContent"], str
+    ):
+        return jsonify({
+            "decision": "block",
+            "reason": "INVALID_SCHEMA"
+        })
+
+    action = data.get("action")
+
+    if not isinstance(action, dict):
+        return jsonify({
+            "decision": "block",
+            "reason": "INVALID_SCHEMA"
+        })
+
+    if not exact_keys(action, ["tool", "args"]):
+        return jsonify({
+            "decision": "block",
+            "reason": "INVALID_SCHEMA"
+        })
+
+    if not isinstance(action["tool"], str):
+        return jsonify({
+            "decision": "block",
+            "reason": "INVALID_SCHEMA"
+        })
+
+    args = action["args"]
+
+    if not isinstance(args, dict):
+        return jsonify({
+            "decision": "block",
+            "reason": "INVALID_SCHEMA"
+        })
+
+    tool = action["tool"]
+
+    # --------------------------------------------------
+    # 2. TOOL ALLOWLIST
+    # --------------------------------------------------
+    allowed_tools = {
+        "search",
+        "lookup_record",
+        "send_email",
+        "render_html"
+    }
+
+    if tool not in allowed_tools:
+        return jsonify({
+            "decision": "block",
+            "reason": "TOOL_NOT_ALLOWED"
+        })
+
+    # --------------------------------------------------
+    # 3. TOOL ARGUMENT SCHEMA
+    # --------------------------------------------------
+
+    # SEARCH
+    if tool == "search":
+        if not exact_keys(args, ["query"]):
+            return jsonify({
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            })
+
+        query = args["query"]
+
+        if not isinstance(query, str):
+            return jsonify({
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            })
+
+        if not (1 <= len(query) <= 200):
+            return jsonify({
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            })
+
+        return jsonify({
+            "decision": "allow",
+            "reason": "ALLOW"
+        })
+
+    # LOOKUP_RECORD
+    if tool == "lookup_record":
+        if not exact_keys(args, ["tenantId", "recordId"]):
+            return jsonify({
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            })
+
+        if not isinstance(args["tenantId"], str):
+            return jsonify({
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            })
+
+        if not isinstance(args["recordId"], str) or not args["recordId"]:
+            return jsonify({
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            })
+
+        if args["tenantId"] != ASSIGNED_TENANT:
+            return jsonify({
+                "decision": "block",
+                "reason": "TENANT_SCOPE"
+            })
+
+        return jsonify({
+            "decision": "allow",
+            "reason": "ALLOW"
+        })
+
+    # SEND_EMAIL
+    if tool == "send_email":
+        if not exact_keys(args, ["to", "subject", "body"]):
+            return jsonify({
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            })
+
+        if (
+            not isinstance(args["to"], str)
+            or not isinstance(args["subject"], str)
+            or not isinstance(args["body"], str)
+        ):
+            return jsonify({
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            })
+
+        # Exact recipient domain check
+        recipient = args["to"]
+
+        if "@" not in recipient:
+            return jsonify({
+                "decision": "block",
+                "reason": "EGRESS_DENIED"
+            })
+
+        local_part, domain = recipient.rsplit("@", 1)
+
+        if not local_part or domain != ALLOWED_EMAIL_DOMAIN:
+            return jsonify({
+                "decision": "block",
+                "reason": "EGRESS_DENIED"
+            })
+
+        if data["humanApproved"] is not True:
+            return jsonify({
+                "decision": "block",
+                "reason": "APPROVAL_REQUIRED"
+            })
+
+        return jsonify({
+            "decision": "allow",
+            "reason": "ALLOW"
+        })
+
+    # RENDER_HTML
+    if tool == "render_html":
+        if not exact_keys(args, ["html"]):
+            return jsonify({
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            })
+
+        if not isinstance(args["html"], str):
+            return jsonify({
+                "decision": "block",
+                "reason": "INVALID_SCHEMA"
+            })
+
+        if not valid_html(args["html"]):
+            return jsonify({
+                "decision": "block",
+                "reason": "UNSAFE_OUTPUT"
+            })
+
+        return jsonify({
+            "decision": "allow",
+            "reason": "ALLOW"
+        })
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
